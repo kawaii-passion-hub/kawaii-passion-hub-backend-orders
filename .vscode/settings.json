@@ -1,0 +1,7 @@
+{
+    "debug.javascript.terminalOptions": {
+      "env": { // environment variable
+        "FIREBASE_DATABASE_EMULATOR_HOST": "localhost:9000"
+      }
+    },
+}
