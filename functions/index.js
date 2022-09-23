@@ -4,12 +4,13 @@ const functions = require("firebase-functions");
 
 // The Firebase Admin SDK to access Realtime Database.
 const admin = require("firebase-admin");
-/* const serviceAccount = require("./service_acounts/serviceAccount.json");
+const newOrderTopic = "new_order";
+const serviceAccount = require("./service_acounts/serviceAccount.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: "https://kawaii-passion-hub-orders-default-rtdb.firebaseio.com",
-}); */
-admin.initializeApp();
+});
+// admin.initializeApp();
 
 const authApp = admin.initializeApp({projectId: "kawaii-passion-hub-auth"},
     "kawaii-passion-hub-auth");
@@ -36,6 +37,22 @@ exports.authenticate = functions.https.onCall(async (data, _) => {
   if (token.whitelisted !== undefined) {
     customClaims.whitelisted = token.whitelisted;
   }
+
+  const notification = data.notification;
+  if (token.whitelisted && notification != undefined) {
+    const response = await admin.messaging().subscribeToTopic(notification,
+        newOrderTopic);
+    if (response.failureCount == 0) {
+      console.log(`Successfully subscribed token ${notification}.`);
+    } else {
+      console.log(`Errors while subscribing token ${notification}.`);
+      response.errors.forEach((error) => {
+        console.error(`${error.error.code}: ${error.error.message}`);
+        console.log(error.error.stack);
+      });
+    }
+  }
+
   try {
     const customToken = await admin.auth().createCustomToken(uid, customClaims);
     return customToken;
@@ -66,6 +83,30 @@ exports.mirror = functions
       res.send("Successfull");
     });
 
+exports.newOrder = functions.database.ref("/orders/{orderId}")
+    .onCreate(async (snapshot, context) => {
+      console.log(`Sending message for new order ${context.params.orderId}.`);
+      try {
+        const order = snapshot.val();
+        const body = `${order.address.firstName} ${order.address.lastName} `+
+        `created an order for ${order.price.netPrice}€ (${order.orderNumber})`;
+        const message = {
+          notification: {
+            title: "New order",
+            body: body,
+          },
+          data: {
+            id: context.params.orderId,
+          },
+          topic: newOrderTopic,
+        };
+        const messageId = await admin.messaging().send(message);
+        console.log(`Successfully send ${messageId}.`);
+      } catch (error) {
+        console.error("Error sending message.", error);
+      }
+    });
+
 exports.resync = functions
     .runWith({
       secrets: ["API_ID", "API_SECRET"],
@@ -75,7 +116,9 @@ exports.resync = functions
       const orders = await fetchOrders();
 
       const db = admin.database();
-      await db.ref("orders").set(orders,
+      const ordersRef = db.ref("orders");
+
+      await ordersRef.set(orders,
           (error) => {
             if (error) {
               throw new functions.https.HttpsError("internal",
