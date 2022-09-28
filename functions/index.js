@@ -80,6 +80,21 @@ exports.mirror = functions
             }
           });
 
+      let openOrders = 0;
+      for (const orderId in orders) {
+        if (orders[orderId].stateMachineState.name == "Open") {
+          openOrders+=1;
+        }
+      }
+
+      await db.ref("public/ordersSummary").update({open: openOrders},
+          (error) => {
+            if (error) {
+              throw new functions.https.HttpsError("internal",
+                  "Could not write to database", error);
+            }
+          });
+
       res.send("Successfull");
     });
 

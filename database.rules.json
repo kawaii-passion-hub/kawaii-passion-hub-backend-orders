@@ -14,6 +14,10 @@
         ".write": false
       }
     },
+    "public": {
+      ".read": true,
+      ".write": false
+    },
     ".read": false,
     ".write": false
   }
