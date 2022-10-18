@@ -5,22 +5,49 @@ const functions = require("firebase-functions");
 // The Firebase Admin SDK to access Realtime Database.
 const admin = require("firebase-admin");
 const newOrderTopic = "new_order";
-const serviceAccount = require("./service_acounts/serviceAccount.json");
+/* const serviceAccount = require("./service_acounts/serviceAccount.json");
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
   databaseURL: "https://kawaii-passion-hub-orders-default-rtdb.firebaseio.com",
-});
-// admin.initializeApp();
+}); */
+admin.initializeApp();
 
 const authApp = admin.initializeApp({projectId: "kawaii-passion-hub-auth"},
     "kawaii-passion-hub-auth");
 
-/* exports.mirrorCron = functions.pubsub.schedule('every 5 minutes')
-.onRun((context) => {
-  console.log('This will be run every 5 minutes!');
+exports.mirrorCron = functions
+    .runWith({
+      secrets: ["API_ID", "API_SECRET"],
+      timeoutSeconds: 540,
+    })
+    .pubsub.schedule("every 15 minutes")
+    .onRun(async (_) => {
+      const orders = await fetchOrders();
 
-  return null;
-}); */
+      const db = admin.database();
+      await db.ref("orders").update(orders,
+          (error) => {
+            if (error) {
+              console.error("Could not write to database", error);
+            }
+          });
+
+      let openOrders = 0;
+      for (const orderId in orders) {
+        if (orders[orderId].stateMachineState.name == "Open") {
+          openOrders+=1;
+        }
+      }
+
+      await db.ref("public/ordersSummary").update({open: openOrders},
+          (error) => {
+            if (error) {
+              console.error("Could not write to database", error);
+            }
+          });
+
+      console.log("Updated orders.");
+    });
 
 exports.authenticate = functions.https.onCall(async (data, _) => {
   const originalJwt = data.jwt;
@@ -63,41 +90,6 @@ exports.authenticate = functions.https.onCall(async (data, _) => {
   }
 });
 
-exports.mirror = functions
-    .runWith({
-      secrets: ["API_ID", "API_SECRET"],
-      timeoutSeconds: 540,
-    })
-    .https.onRequest(async (_data, res) => {
-      const orders = await fetchOrders();
-
-      const db = admin.database();
-      await db.ref("orders").update(orders,
-          (error) => {
-            if (error) {
-              throw new functions.https.HttpsError("internal",
-                  "Could not write to database", error);
-            }
-          });
-
-      let openOrders = 0;
-      for (const orderId in orders) {
-        if (orders[orderId].stateMachineState.name == "Open") {
-          openOrders+=1;
-        }
-      }
-
-      await db.ref("public/ordersSummary").update({open: openOrders},
-          (error) => {
-            if (error) {
-              throw new functions.https.HttpsError("internal",
-                  "Could not write to database", error);
-            }
-          });
-
-      res.send("Successfull");
-    });
-
 exports.newOrder = functions.database.ref("/orders/{orderId}")
     .onCreate(async (snapshot, context) => {
       console.log(`Sending message for new order ${context.params.orderId}.`);
@@ -122,28 +114,6 @@ exports.newOrder = functions.database.ref("/orders/{orderId}")
       }
     });
 
-exports.resync = functions
-    .runWith({
-      secrets: ["API_ID", "API_SECRET"],
-      timeoutSeconds: 540,
-    })
-    .https.onRequest(async (_data, res) => {
-      const orders = await fetchOrders();
-
-      const db = admin.database();
-      const ordersRef = db.ref("orders");
-
-      await ordersRef.set(orders,
-          (error) => {
-            if (error) {
-              throw new functions.https.HttpsError("internal",
-                  "Could not write to database", error);
-            }
-          });
-
-      res.send("Successfull");
-    });
-
 async function fetchOrders() {
   const auth = await shopLogin();
   const body = await getOrders(auth);
@@ -155,11 +125,8 @@ async function fetchOrders() {
       .map((p) => [p.id, p.attributes]));
 
   console.log(`Completing ${Object.keys(orders).length} orders.`);
-  let remaining = Object.keys(orders).length;
   await parallelForEach(body.data, async (order) => {
-    remaining -= 1;
     const orderNumber = order.attributes.orderNumber.replace(/\./g, "-");
-    console.log(`Processing ${orderNumber}. ${remaining} unprocessed.`);
     orders[orderNumber].stateMachineState = included[order.attributes.stateId];
     orders[orderNumber].orderCustomer = included[order.relationships
         .orderCustomer.data.id];
@@ -167,26 +134,65 @@ async function fetchOrders() {
         .lineItems.links.related;
     orders[orderNumber].addressUrl = order.relationships
         .addresses.links.related;
-    await completeOrder(orders[orderNumber]);
+    orders[orderNumber].deliveryUrl = order.relationships
+        .deliveries.links.related;
+    orders[orderNumber].documentsUrl = order.relationships
+        .documents.links.related;
+    await completeOrder(orders[orderNumber], auth);
   }, 5);
 
   return orders;
 }
 
-async function completeOrder(order) {
-  const auth = await shopLogin();
-
+async function completeOrder(order, auth) {
   let details = await getShopApiResponse(auth, order.lineItemsUrl, true);
-  const items = Object.fromEntries(details.data
-      .map((p) => [p.id, p.attributes]));
+  const items = Object.fromEntries(await Promise.all(details.data
+      .map(async (p) => [p.id, await getAttributesWithWeight(p)])));
   order.lineItems = items;
+  delete order.lineItemsUrl;
+
+  details = await getShopApiResponse(auth, order.documentsUrl, true);
+  const invoiceNumber = details.data
+      .find((d) => d.attributes.config.name === "invoice")
+      ?.attributes.config.custom.invoiceNumber;
+  if (invoiceNumber) {
+    order.invoiceNumber = invoiceNumber;
+  }
+  delete order.documentsUrl;
 
   details = await getShopApiResponse(auth, order.addressUrl, true);
   order.address = details.data[0].attributes;
+  delete order.addressUrl;
+
+  let countryDetails = await getShopApiResponse(auth, details.data[0]
+      .relationships.country.links.related, true);
+  order.address.country = countryDetails.data[0].attributes;
+
+  if (order.address.countryStateId) {
+    countryDetails = await getShopApiResponse(auth, details.data[0]
+        .relationships.countryState.links.related, true);
+    order.address.countryState = countryDetails.data[0].attributes;
+  }
+
+  details = await getShopApiResponse(auth, order.deliveryUrl, true);
+  order.deliveries = details.data[0].attributes;
+  order.deliveries.stateMachineState =
+    details.included.find((i) => i.type == "state_machine_state").attributes;
+  delete order.deliveryUrl;
 
   details = await getShopApiResponse(auth, details.data[0].relationships
-      .country.links.related, true);
-  order.address.country = details.data[0].attributes;
+      .shippingMethod.links.related, true);
+  order.deliveries.shippingMethod = details.data[0].attributes;
+
+  async function getAttributesWithWeight(lineItem) {
+    const result = lineItem.attributes;
+    if (result.productId) {
+      const details = await getShopApiResponse(auth, lineItem.relationships
+          .product.links.related, true);
+      result.weight = details.data[0].attributes.weight??0.0;
+    }
+    return result;
+  }
 }
 
 async function parallelForEach(array, callback, maxParallel) {

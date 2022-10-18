@@ -5,7 +5,7 @@
       ".write": false
     },
     "orders": {
-      ".read": "auth.token.whitelisted === true",
+      ".read": "auth.token.whitelisted === true || auth.uid === 'service-worker'",
       ".write": false
     },
     "metadata": {
